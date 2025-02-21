@@ -122,6 +122,8 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        total_topk_ids: Optional[torch.Tensor] = None,
+        total_topk_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -141,10 +143,24 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.gate = MoEGate(config=config)
+        self.enable_ep_moe = global_server_args_dict["enable_ep_moe"]
 
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        if not global_server_args_dict["enable_ep_moe"]:
+            MoEImpl = FusedMoE
+            if config.n_shared_experts is not None:
+                intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+                self.shared_experts = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                )
+        else:
+            MoEImpl = EPMoE
         self.experts = MoEImpl(
             num_experts=config.n_routed_experts,
+            num_shared_experts=config.n_shared_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -154,31 +170,30 @@ class DeepseekV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            total_topk_ids=total_topk_ids,
+            total_topk_weights=total_topk_weights,
         )
 
-        if config.n_shared_experts is not None:
-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV2MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
-            * self.routed_scaling_factor
-        )
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+        if self.enable_ep_moe:
+            final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        else:
+            if self.n_shared_experts is not None:
+                shared_output = self.shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            final_hidden_states = (
+                self.experts(hidden_states=hidden_states, router_logits=router_logits)
+                * self.routed_scaling_factor
+            )
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output
+        # if get_tensor_model_parallel_rank() == 0:
+        #     print(f"final_hidden_states: {final_hidden_states}")
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -674,6 +689,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        total_topk_ids: Optional[torch.Tensor] = None,
+        total_topk_weights: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -730,7 +747,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekV2MoE(config=config, quant_config=quant_config, total_topk_ids=total_topk_ids, total_topk_weights=total_topk_weights)
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
@@ -793,6 +810,31 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        if global_server_args_dict["enable_ep_moe"]:
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+            top_k = config.num_experts_per_tok
+            num_experts = config.n_routed_experts
+            num_shared_experts = config.n_shared_experts
+            fake_expertid = num_experts + num_shared_experts
+
+            MAX_TOKENS = 4096 * 100
+            self.total_topk_ids = torch.empty((MAX_TOKENS, top_k + num_shared_experts + 1), dtype=torch.int32, device='cuda')
+            self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split([top_k, num_shared_experts + 1], dim=1)
+            shared_expert_ids = [num_experts + i for i in range(num_shared_experts + 1)]
+            s_topk_ids_list = [[fake_expertid]* (num_shared_experts + 1)] * MAX_TOKENS
+            for i in range(tp_rank, MAX_TOKENS, tp_size):
+                s_topk_ids_list[i] = shared_expert_ids
+            self.s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=torch.int32, device='cuda')
+
+            self.total_topk_weights = torch.empty((MAX_TOKENS, top_k + num_shared_experts + 1), dtype=torch.float32, device='cuda')
+            self.ns_topk_weights, self.s_topk_weights = self.total_topk_weights.split([top_k, num_shared_experts + 1], dim=1)
+            shared_E_score = 1.0
+            self.s_topk_weights[:] = shared_E_score
+        else:
+            self.total_topk_ids = None
+            self.total_topk_weights = None
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -804,6 +846,8 @@ class DeepseekV2Model(nn.Module):
                     config,
                     layer_id,
                     quant_config=quant_config,
+                    total_topk_ids=self.total_topk_ids,
+                    total_topk_weights=self.total_topk_weights,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -839,6 +883,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = DeepseekV2Model(config, quant_config)
+        self.tp_rank = get_tensor_model_parallel_rank()
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
@@ -879,9 +924,14 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts,
+            num_shared_experts=self.config.n_shared_experts,
         )
 
         params_dict = dict(self.named_parameters())
+        # if self.tp_rank == 0:
+        #     print("expert_params_mapping", expert_params_mapping)
+        #     print("params_dict",params_dict.keys())
+        # return
         for name, loaded_weight in weights:
             # TODO(HandH1998): Modify it when nextn is supported.
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -907,6 +957,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
+                if global_server_args_dict["enable_ep_moe"] and ("mlp.shared_experts" in name):
+                    continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -920,6 +972,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
+                    # if self.tp_rank == 0:
+                    #     print(f"{name=} {weight_name=} {param_name=}")
                     name = name.replace(weight_name, param_name)
                     param = params_dict[name]
                     weight_loader = param.weight_loader

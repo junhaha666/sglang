@@ -26,6 +26,12 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.utils import is_hip, set_weight_attrs
 
+import aiter
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from aiter.ops.shuffle import shuffle_weight
+from aiter.fused_moe_gelu import fused_topk
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +121,10 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        num_shared_experts: Optional[int] = 0,
+        routed_scaling_factor: Optional[float] = 1.0,
+        total_topk_ids: Optional[torch.Tensor] = None,
+        total_topk_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -127,6 +137,8 @@ class EPMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.num_total_experts = self.num_experts + self.num_shared_experts + 1 # 1 fake expert
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
@@ -158,18 +170,70 @@ class EPMoE(torch.nn.Module):
 
         self.quant_method.create_weights(
             layer=self,
-            num_experts_per_partition=self.num_experts_per_partition,
+            num_experts_per_partition=self.num_experts_per_partition + self.num_shared_experts,
             hidden_size=hidden_size,
             intermediate_size=self.intermediate_size,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            num_shared_experts = self.num_shared_experts,
         )
 
         self.grouped_gemm_runner = None
+        
+        self.aiter_shuffle = False
+        self.routed_scaling_factor = routed_scaling_factor
+
+        self.expert_mask = torch.zeros((self.num_experts + self.num_shared_experts + 1) , device='cuda', dtype=torch.int)
+        self.expert_mask[self.start_expert_id : self.end_expert_id + 1] = 1
+        self.expert_mask[self.num_experts:-1] = 1
+        fake_expertid = self.expert_mask.numel() - 1
+        # print(f"{self.tp_rank=} expert_mask: {self.expert_mask}")
+
+        self.total_topk_ids = total_topk_ids
+        self.total_topk_weights = total_topk_weights
+        self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split([top_k, self.num_shared_experts + 1], dim=1)
+        self.ns_topk_weights, self.s_topk_weights = self.total_topk_weights.split([top_k, self.num_shared_experts + 1], dim=1)
+
+        
+        # MAX_TOKENS = 4096
+        # self.total_topk_ids = torch.empty((MAX_TOKENS, top_k + self.num_shared_experts + 1), dtype=torch.int32, device='cuda')
+        # self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split([top_k, self.num_shared_experts + 1], dim=1)
+        # shared_expert_ids = [self.num_experts + i for i in range(self.num_shared_experts + 1)]
+        # s_topk_ids_list = [[fake_expertid]* (self.num_shared_experts + 1)] * MAX_TOKENS
+        # for i in range(self.tp_rank, MAX_TOKENS, self.tp_size):
+        #     s_topk_ids_list[i] = shared_expert_ids
+        # self.s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=torch.int32, device='cuda')
+
+        # self.total_topk_weights = torch.empty((MAX_TOKENS, top_k + self.num_shared_experts + 1), dtype=torch.float32, device='cuda')
+        # self.ns_topk_weights, self.s_topk_weights = self.total_topk_weights.split([top_k, self.num_shared_experts + 1], dim=1)
+        # shared_E_score = 1.0
+        # self.s_topk_weights[:] = shared_E_score
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        if not self.aiter_shuffle:
+            self.w13_weight.data = shuffle_weight(self.w13_weight.contiguous(), (16, 16))
+            self.w2_weight.data = shuffle_weight(self.w2_weight.contiguous(), (16, 16))
+            self.aiter_shuffle = True
+        # Matrix multiply.
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            activation=self.activation,
+            expert_mask=self.expert_mask,
+        )
+
+
+        return final_hidden_states
 
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
@@ -317,6 +381,7 @@ class EPMoE(torch.nn.Module):
         ckpt_down_proj_name: str,
         ckpt_up_proj_name: str,
         num_experts: int,
+        num_shared_experts: Optional[int] = 0,
     ) -> List[Tuple[str, str, int, str]]:
         return [
             # (param_name, weight_name, expert_id, shard_id)
@@ -336,7 +401,24 @@ class EPMoE(torch.nn.Module):
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
             ]
-        ]
+        ] + [
+            (
+                (
+                    "experts.w13_"
+                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
+                    else "experts.w2_"
+                ),
+                f"shared_experts.{expert_id}.{weight_name}." if num_shared_experts >= 2 else f"shared_experts.{weight_name}.",
+                -num_shared_experts + expert_id,
+                shard_id,
+            )
+            for expert_id in range(num_shared_experts)
+            for shard_id, weight_name in [
+                ("w1", ckpt_gate_proj_name),
+                ("w2", ckpt_down_proj_name),
+                ("w3", ckpt_up_proj_name),
+            ]
+        ] 
 
     def weight_loader(
         self,
@@ -346,9 +428,11 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        if expert_id >= 0 and (expert_id < self.start_expert_id or expert_id > self.end_expert_id):
             return
-        expert_id = expert_id - self.start_expert_id
+        #expert_id < 0 means shared expert
+        if expert_id >=0:
+            expert_id = expert_id - self.start_expert_id
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(
@@ -357,6 +441,12 @@ class EPMoE(torch.nn.Module):
 
         # Special case for fp8 scales.
         if "scale" in weight_name:
+            # if quant_method in [
+            #     FusedMoeWeightScaleSupported.GROUP.value,
+            #     FusedMoeWeightScaleSupported.BLOCK.value,
+            # ]:
+            #     param.data[expert_id] = loaded_weight
+            # else:
             self._load_fp8_scale(
                 param.data, loaded_weight, weight_name, shard_id, expert_id
             )
@@ -394,6 +484,13 @@ class EPMoE(torch.nn.Module):
                 )
             param_data[expert_id] = loaded_weight
         # Weight scales
+        elif "weight_scale_inv" in weight_name:
+        # elif getattr(param, "quant_method", None) == FusedMoeWeightScaleSupported.BLOCK.value:
+            if shard_id in ("w1", "w3"):
+                idx = 0 if shard_id == "w1" else 1
+                param_data[expert_id].view(2,-1)[idx] = loaded_weight.view(-1)
+            else:
+                param_data[expert_id] = loaded_weight
         elif "weight_scale" in weight_name:
             # If we are in merged column case (gate_up_proj)
             if shard_id in ("w1", "w3"):
@@ -404,6 +501,7 @@ class EPMoE(torch.nn.Module):
             # If we are in the row parallel case (down_proj)
             else:
                 param_data[expert_id] = loaded_weight
+        
 
 
 class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
@@ -498,6 +596,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
+        self.block_quant = self.quant_config.weight_block_size is not None
 
     def create_weights(
         self,
@@ -538,21 +637,52 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        # Allocate 2 scales for w1 and w3 respectively.
-        w13_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        if self.block_quant:
+            block_n, block_k = (
+                self.quant_config.weight_block_size[0],
+                self.quant_config.weight_block_size[1],
+            )
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    2 * ((intermediate_size + block_n - 1) // block_n),
+                    (hidden_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts_per_partition,
+                    (hidden_size + block_n - 1) // block_n,
+                    (intermediate_size + block_k - 1) // block_k,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+            assert self.quant_config.activation_scheme == "dynamic"
+        else:
+            # Allocate 2 scales for w1 and w3 respectively.
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, 2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        w2_weight_scale = torch.nn.Parameter(
-            torch.ones(num_experts_per_partition, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update({"quant_method": "tensor"})
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            if self.block_quant
+            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
@@ -581,10 +711,10 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+
 
     def process_weights_after_loading(self, layer: Module) -> None:
 
@@ -642,5 +772,88 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        expert_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        # raise NotImplementedErrors
+        # Expert selection
+
+        # token = x.shape[0]
+        # fake_expertid = expert_mask.numel() - 1
+        # total_topk_ids = torch.empty((token, top_k + layer.num_shared_experts + 1), dtype=torch.int32, device='cuda')
+        # ns_topk_ids, s_topk_ids = total_topk_ids.split([top_k, layer.num_shared_experts + 1], dim=1)
+        # shared_expert_ids = [layer.num_experts + i for i in range(layer.num_shared_experts + 1)]
+        # s_topk_ids_list = [[fake_expertid]* (layer.num_shared_experts + 1)] * token
+        # for i in range(layer.tp_rank, token, layer.tp_size):
+        #     s_topk_ids_list[i] = shared_expert_ids
+        # s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=torch.int32, device='cuda')
+
+        # total_topk_weights = torch.empty((token, top_k + layer.num_shared_experts + 1), dtype=torch.float32, device='cuda')
+        # ns_topk_weights, s_topk_weights = total_topk_weights.split([top_k, layer.num_shared_experts + 1], dim=1)
+        # shared_E_score = 1.0
+        # s_topk_weights[:] = shared_E_score
+
+        # fused_topk(x, router_logits, top_k, True, ns_topk_ids, ns_topk_weights)
+        # ns_topk_weights[:] = ns_topk_weights * layer.routed_scaling_factor
+        # topk_ids = total_topk_ids
+        # topk_weights = total_topk_weights
+
+        # token = x.shape[0]
+        # fused_topk(x, router_logits, top_k, True, layer.ns_topk_ids, layer.ns_topk_weights)
+        # layer.ns_topk_weights[:] = layer.ns_topk_weights * layer.routed_scaling_factor
+        # topk_ids = layer.total_topk_ids[:token]
+        # topk_weights = layer.total_topk_weights[:token]
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+        )
+        # if layer.tp_rank == 0:
+        #     print(f"{x.shape=} {router_logits.shape=}")
+        #     print(f"{topk_ids.shape=}{topk_weights.shape=}")
+        token = x.shape[0]
+        layer.ns_topk_weights[:token] = topk_weights * layer.routed_scaling_factor
+        layer.ns_topk_ids[:token] = topk_ids
+        topk_ids = layer.total_topk_ids[:token]
+        topk_weights = layer.total_topk_weights[:token]
+
+
+        # if layer.tp_rank == 0:
+        #     print(f"{x.shape=} {router_logits.shape=}")
+        #     print(f"{layer.ns_topk_ids.shape=}{layer.ns_topk_ids.stride()}")
+        #     print(f"{router_logits=}")
+        #     print(f"{topk_ids=}")
+        #     print(f"{topk_weights=}")
+
+
+        return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=activation,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+                expert_mask=expert_mask,
+            )
+

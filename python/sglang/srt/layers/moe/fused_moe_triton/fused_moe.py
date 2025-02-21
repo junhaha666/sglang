@@ -849,17 +849,50 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    expert_mask: Optional[torch.Tensor] = None,
 ):
 
-    E = w1.shape[0]
+    loacl_E = w1.shape[0]
+    if expert_mask is not None:
+        global_E = expert_mask.numel()
+    else:
+        global_E = loacl_E
     topk = topk_ids.shape[1]
     model_dim = w1.shape[-1]
     dtype = hidden_states.dtype
     scale_blk_k = block_shape[1]
 
-    sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = moe_sorting_ck(topk_ids, topk_weights, E,
-                                                                                                    model_dim, dtype)
+    sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = moe_sorting_ck(topk_ids, topk_weights, global_E,
+                                                                                                    model_dim, dtype, expert_mask)
     a1, a1_scale = per_token_group_quant_fp8(hidden_states, scale_blk_k)
+    num_valid_ids_v = num_valid_ids[0].item()
+    sorted_token_ids2 = sorted_token_ids & 0xffffff
+    sorted_token_ids3 = sorted_token_ids >> 24
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    rank = get_tensor_model_parallel_rank()
+    # if expert_mask[0].item() == 1:
+    #     print(f"{sorted_token_ids2[:num_valid_ids_v]=}")
+    #     print(f"{sorted_token_ids3[:num_valid_ids_v]=}")
+    #     print(f"{num_valid_ids=}")
+    #     print(f"{sorted_expert_ids[:num_valid_ids_v//32]=}")
+    #     print(f"{topk=}")
+    #     print(f"{block_shape=}")
+    #     print(f"{a1.shape=}")
+    #     print(f"{a1_scale.shape=}")
+    #     print(f"a1 {torch.isnan(a1).any()}")
+    #     # print(f"w1 {torch.isnan(w1).any()}")
+    #     # print(f"w2 {torch.isnan(w2).any()}")
+    #     # print(f"w1_scale {torch.isnan(w1_scale).any()}")
+    #     # print(f"w2_scale {torch.isnan(w2_scale).any()}")
+    #     # print(f"a1_scale {torch.isnan(a1_scale).any()}")
+    #     print(f"{w1.shape=}")
+    #     print(f"{w2.shape=}")
+    #     print(f"{w1_scale.shape=}")
+    #     print(f"{w2_scale.shape=}")
+        
+    #     print(f"{w1.view(-1)[:8]=}")
+    #     print(f"{w2.view(-1)[:8]=}")
+    #     print(f"{w1_scale.view(-1)[:8]=}")
     aiter.fmoe_fp8_blockscale_g1u1(out_asm, 
                                     a1, 
                                     w1, 
@@ -869,12 +902,14 @@ def fused_experts(
                                     sorted_expert_ids, 
                                     num_valid_ids,
                                     topk,
-                                    w1_scale.view(E, -1),
-                                    w2_scale.view(E, -1),
+                                    w1_scale.view(loacl_E, -1),
+                                    w2_scale.view(loacl_E, -1),
                                     a1_scale.t().contiguous(),
                                     block_shape[0], 
                                     block_shape[1],
                                     None)
+    # if expert_mask[0].item() == 1:
+    #     print(f"{rank=} {out_asm=}")
     return out_asm
 
 
