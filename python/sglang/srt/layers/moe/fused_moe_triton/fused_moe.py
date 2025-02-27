@@ -865,11 +865,11 @@ def fused_experts(
     sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = moe_sorting_ck(topk_ids, topk_weights, global_E,
                                                                                                     model_dim, dtype, expert_mask)
     a1, a1_scale = per_token_group_quant_fp8(hidden_states, scale_blk_k)
-    num_valid_ids_v = num_valid_ids[0].item()
-    sorted_token_ids2 = sorted_token_ids & 0xffffff
-    sorted_token_ids3 = sorted_token_ids >> 24
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-    rank = get_tensor_model_parallel_rank()
+    # num_valid_ids_v = num_valid_ids[0].item()
+    # sorted_token_ids2 = sorted_token_ids & 0xffffff
+    # sorted_token_ids3 = sorted_token_ids >> 24
+    # from sglang.srt.distributed import get_tensor_model_parallel_rank
+    # rank = get_tensor_model_parallel_rank()
     # if expert_mask[0].item() == 1:
     #     print(f"{sorted_token_ids2[:num_valid_ids_v]=}")
     #     print(f"{sorted_token_ids3[:num_valid_ids_v]=}")

@@ -31,9 +31,15 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from aiter.ops.shuffle import shuffle_weight
 from aiter.fused_moe_gelu import fused_topk
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+from sglang.srt.layers.quantization.fp8_utils import (
+    BlockQuantScaleParameter,
+    apply_w8a8_block_fp8_linear,
+    normalize_e4m3fn_to_e4m3fnuz,
+)
 
 logger = logging.getLogger(__name__)
 
+is_hip_ = is_hip()
 
 class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
@@ -213,10 +219,10 @@ class EPMoE(torch.nn.Module):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        if not self.aiter_shuffle:
-            self.w13_weight.data = shuffle_weight(self.w13_weight.contiguous(), (16, 16))
-            self.w2_weight.data = shuffle_weight(self.w2_weight.contiguous(), (16, 16))
-            self.aiter_shuffle = True
+        # if not self.aiter_shuffle:
+        #     self.w13_weight.data = shuffle_weight(self.w13_weight.contiguous(), (16, 16))
+        #     self.w2_weight.data = shuffle_weight(self.w2_weight.contiguous(), (16, 16))
+        #     self.aiter_shuffle = True
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -759,6 +765,41 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     torch.max(layer.w13_weight_scale, dim=1).values,
                     requires_grad=False,
                 )
+
+        if self.block_quant:
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if is_hip_:
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
+                import aiter
+                from aiter.ops.shuffle import shuffle_weight
+
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
             return
 
     def apply(
@@ -813,6 +854,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
+            correction_bias=layer.correction_bias,
         )
         # if layer.tp_rank == 0:
         #     print(f"{x.shape=} {router_logits.shape=}")
