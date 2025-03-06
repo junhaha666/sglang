@@ -11,6 +11,9 @@ from vllm import _custom_ops as ops
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import is_cuda_available
 
+import os
+import aiter
+
 _is_cuda_available = is_cuda_available()
 if _is_cuda_available:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -708,6 +711,11 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
         print("Cache shape", cache.shape)
+
+        if os.getenv("SGLANG_ROCM_AITER_ROPE") == "1":
+            self.register_buffer("cos_cache", cos, persistent=False)
+            self.register_buffer("sin_cache", sin, persistent=False)
+
         return cache
 
     def forward(
@@ -717,6 +725,25 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        if os.getenv("SGLANG_ROCM_AITER_ROPE") == "1":
+            assert self.rotary_dim == self.head_size, "AITER ROPE only support rotary_dim == head_size"
+            cos, sin = self.cos_cache, self.sin_cache
+            rotate_style = 0 if self.is_neox_style else 1
+            query = query.unsqueeze(0)
+            key = key.unsqueeze(0)
+            positions = positions.unsqueeze(0)
+            cos = cos.unsqueeze(-2).unsqueeze(-2)
+            sin = sin.unsqueeze(-2).unsqueeze(-2)
+            # print(f"{positions.shape=}, {query.shape=}, {key.shape=}, {cos.shape=}, {sin.shape=}")
+            if offsets is None:
+                aiter.rope_cached_positions_2c_fwd_inplace(query, key, cos, sin, positions, rotate_style, 
+                                                               reuse_freqs_front_part=True, nope_first=True)
+            else:
+                aiter.rope_cached_positions_offsets_2c_fwd_inplace(query, key, cos, sin, positions, offsets, rotate_style, 
+                                                                reuse_freqs_front_part=True, nope_first=True)
+            return query, key
+
         """PyTorch-native implementation equivalent to forward()."""
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
